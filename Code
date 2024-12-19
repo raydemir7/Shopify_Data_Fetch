@@ -1,0 +1,253 @@
+import base64
+import functions_framework
+import requests
+import gspread
+import pytz
+from datetime import datetime, timedelta, date  # Import date explicitly
+import time
+import json
+import os
+
+# Shopify store details and access token
+shop_creds = {
+    "api_key": os.getenv("SHOP_API_KEY"),
+    "api_secret": os.getenv("SHOP_API_SECRET"),
+    "api_token": os.getenv("SHOP_API_TOKEN")
+}
+
+# Define your local timezone (change if needed)
+local_timezone = pytz.timezone("America/New_York")
+
+
+
+# Function to fetch Shopify data for a given date
+def fetch_shopify_data(fetch_date):
+    # Ensure fetch_date is a datetime object to add time components
+    if isinstance(fetch_date, date):  # Use 'date' directly instead of 'datetime.date'
+        fetch_date = datetime.combine(fetch_date, datetime.min.time())
+
+    start_date_local = fetch_date.replace(hour=0, minute=0, second=0)
+    end_date_local = fetch_date.replace(hour=23, minute=59, second=59)
+
+    # Convert to local timezone-aware datetime objects
+    start_date_local_aware = local_timezone.localize(start_date_local)
+    end_date_local_aware = local_timezone.localize(end_date_local)
+
+    # Convert to UTC
+    start_date_utc = start_date_local_aware.astimezone(pytz.utc)
+    end_date_utc = end_date_local_aware.astimezone(pytz.utc)
+
+    # Format for API request
+    start_date_utc_str = start_date_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    end_date_utc_str = end_date_utc.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Shopify API domain and orders endpoint
+    domain = 'https://xxxxh.myshopify.com'
+    endpoint = '/admin/api/2024-10/orders.json'
+    query_params = f'?status=any&limit=250&created_at_min={start_date_utc_str}&created_at_max={end_date_utc_str}'
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": shop_creds['api_token']
+    }
+
+    daily_totals = {
+        "subtotal": 0,
+        "tax": 0,
+        "shipping": 0,
+        "refunds": 0,
+        "total_sales": 0,
+        "order_count": 0
+    }
+
+    # Handle pagination to get more than 250 orders (if applicable)
+    next_page_info = None
+    while True:
+        page_url = f"{domain}{endpoint}{query_params}"
+        if next_page_info:
+            page_url += f"&page_info={next_page_info}"
+
+        response_data = make_api_request_with_retry(page_url, headers)
+        if response_data is None:
+            print(f"Failed to fetch orders for {fetch_date.strftime('%Y-%m-%d')}. Skipping this date.")
+            return daily_totals, fetch_date.strftime('%Y-%m-%d')
+
+        try:
+            if 'orders' in response_data and len(response_data['orders']) > 0:
+                for order in response_data['orders']:
+                    # Filter by sales channel
+                    if order.get('source_name') not in ['web', 'subscription_contract', 'iphone' ,'2329312']:
+                        continue
+
+                    daily_totals["order_count"] += 1
+                    daily_totals["subtotal"] += float(order.get('subtotal_price', 0))
+                    daily_totals["tax"] += float(order.get('total_tax', 0))
+                    daily_totals["shipping"] += float(order['total_shipping_price_set']['presentment_money']['amount'])
+
+                    refunds_amount = sum(
+                        float(transaction['amount']) for refund in order.get('refunds', [])
+                        for transaction in refund.get('transactions', []) if transaction.get('kind') == 'refund'
+                    )
+                    daily_totals["refunds"] += refunds_amount
+
+                total_sales = daily_totals["subtotal"] - daily_totals["refunds"] + daily_totals["tax"] + daily_totals["shipping"]
+                daily_totals["total_sales"] = total_sales
+
+            if 'next_page_info' in response_data:
+                next_page_info = response_data['next_page_info']
+            else:
+                break
+
+        except Exception as e:
+            print(f"Error processing response for {fetch_date.strftime('%Y-%m-%d')}: {e}")
+            return daily_totals, fetch_date.strftime('%Y-%m-%d')
+
+    return daily_totals, fetch_date.strftime('%Y-%m-%d')
+
+
+# Function to batch update data in Google Sheets with specified logic
+def write_shopify_data_to_gs(rows, sheet_name: str = "xxx"):
+    HEADER = ["Date", "Subtotal", "Tax", "Shipping", "Refunds", "Total Sales", "Order Count"]
+    try:
+        gc = gspread.service_account(filename='service_account.json')
+        sh = gc.open("xxx")
+        worksheet = sh.worksheet(sheet_name)
+
+        # Check if the sheet is empty or missing headers
+        existing_data = worksheet.get_all_values()
+        if not existing_data or existing_data[0] != HEADER:
+            # Insert headers if they're not present
+            worksheet.insert_row(HEADER, 1)
+            worksheet.freeze(rows=1)
+            print("Headers added to Google Sheet.")
+
+        # Map existing dates to rows to identify missing dates
+        existing_dates = {row[0]: idx + 1 for idx, row in enumerate(existing_data[1:])}
+        today = datetime.now().date()
+        start_date = datetime(2023, 1, 1).date()  # Start from January 1 of this year
+
+        # Fill any missing dates from start_date to today
+        for date, totals in rows:
+            if date not in existing_dates:
+                worksheet.append_row(
+                    [date, totals["subtotal"], totals["tax"], totals["shipping"], totals["refunds"], totals["total_sales"], totals["order_count"]],
+                    value_input_option='USER_ENTERED'
+                )
+                print(f"Added missing date data for {date}")
+
+        # Check the last written date
+        last_date_str = existing_data[-1][0] if len(existing_data) > 1 else None
+        last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date() if last_date_str else None
+
+        # If the last written date is today, clear the last two rows and re-append them
+        if last_date == today:
+            print("Clearing the last two rows to re-append updated data for today and yesterday.")
+            worksheet.delete_rows(len(existing_data) - 1, len(existing_data))
+
+            # Re-append today’s and yesterday’s data
+            for date, totals in rows[-2:]:
+                worksheet.append_row(
+                    [date, totals["subtotal"], totals["tax"], totals["shipping"], totals["refunds"], totals["total_sales"], totals["order_count"]],
+                    value_input_option='USER_ENTERED'
+                )
+                print(f"Re-appended updated data for {date}")
+
+    except gspread.exceptions.APIError as e:
+        print(f"Google Sheets API error: {e}")
+
+
+def make_api_request_with_retry(url, headers, max_retries=10):
+    """
+    Makes an API request to Shopify with custom retry logic for rate limiting and server errors.
+
+    Args:
+        url (str): The API endpoint URL.
+        headers (dict): The headers to include in the API request.
+        max_retries (int): Maximum number of retry attempts.
+
+    Returns:
+        dict: Parsed JSON response if successful, None otherwise.
+    """
+    retry_wait_times = [0, 5, 15, 30]  # Custom retry intervals in seconds for specific attempts
+    retries = 0
+
+    while retries < max_retries:
+        try:
+            response = requests.get(url, headers=headers)
+
+            # Successful response
+            if response.status_code == 200:
+                return response.json()
+
+            # Rate limiting
+            elif response.status_code == 429:
+                retry_after = response.headers.get('Retry-After')
+                if retry_after:
+                    retry_after = int(float(retry_after))  # Convert Retry-After to integer
+                else:
+                    # Use custom retry intervals if Retry-After header is not present
+                    retry_after = retry_wait_times[retries] if retries < len(retry_wait_times) else 60
+                print(f"Rate limit exceeded. Retrying after {retry_after} seconds. Attempt {retries + 1}/{max_retries}.")
+                time.sleep(retry_after)
+
+            # Server unavailable
+            elif response.status_code == 503:
+                wait_time = retry_wait_times[retries] if retries < len(retry_wait_times) else 60
+                print(f"Server unavailable (503). Retrying in {wait_time} seconds. Attempt {retries + 1}/{max_retries}.")
+                time.sleep(wait_time)
+
+            # Other errors
+            else:
+                print(f"Unexpected response from Shopify: {response.status_code}, {response.text}")
+                response.raise_for_status()
+
+        except requests.exceptions.RequestException as e:
+            # Retry on network-related exceptions
+            retries += 1
+            wait_time = retry_wait_times[retries] if retries < len(retry_wait_times) else 60
+            print(f"API request error: {e}. Retrying in {wait_time} seconds. Attempt {retries + 1}/{max_retries}.")
+            time.sleep(wait_time)
+
+        retries += 1
+
+    # Log and return None if all retries are exhausted
+    print(f"Failed to complete API request after {max_retries} retries. URL: {url}")
+    return None
+
+
+
+# Modify shopify_script to handle weekly batches and add a delay between batches.
+def shopify_script():
+    today = datetime.now().date()
+    start_date = datetime(today.year, 1, 1).date()  # Start from January 1 of this year
+
+    print(f"Fetching and updating data from {start_date} to {today}")
+
+    # Generate list of weeks to process from January 1 to today.
+    # Each week will have a start and end date.
+    date_batches = [
+        (start_date + timedelta(days=i), min(today, start_date + timedelta(days=i + 6)))
+        for i in range(0, (today - start_date).days + 1, 7)
+    ]
+
+    rows = []
+    for week_start, week_end in date_batches:
+        print(f"Processing data for week: {week_start} to {week_end}")
+
+        # Fetch data for each day in the current week
+        for current_date in (week_start + timedelta(days=i) for i in range((week_end - week_start).days + 1)):
+            daily_totals, fetch_date = fetch_shopify_data(current_date)
+            rows.append((fetch_date, daily_totals))
+
+        # Add a delay between batches to respect Shopify's rate limit
+        print("Waiting for 5 seconds before fetching the next batch...")
+        time.sleep(5)
+
+    write_shopify_data_to_gs(rows)
+    return "Shopify data year-to-date successfully fetched and added to Google Sheets"
+
+# Entry point for Google Cloud Function
+@functions_framework.cloud_event
+def hello_pubsub(cloud_event):
+    shopify_script()
+
